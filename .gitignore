@@ -54,3 +54,15 @@ reports
 # user files
 **/.sync_cache
 /packages/e2e-tests/res
+
+
+#claude
+.claude
+CLAUDE.md
+release-manifest.json
+plans/templates
+.repomixignore
+.opencode
+AGENTS.md
+repomix-output.xml
+.yarn/install-state.gz
