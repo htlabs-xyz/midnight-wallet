@@ -43,7 +43,6 @@ jobs:
           cache: 'yarn'
           cache-dependency-path: 'yarn.lock'
           # This is required for the npm publish step
-          token: ${{ env.VERDACCIO_TOKEN }}
           registry-url: ${{ env.VERDACCIO_URL }}
           scope: '@midnight-ntwrk'
 
