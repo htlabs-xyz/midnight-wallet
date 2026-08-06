@@ -1,0 +1,83 @@
+name: CD Canary
+
+env:
+  VERDACCIO_URL: ${{ secrets.VERDACCIO_URL }}
+  VERDACCIO_AUTH_TOKEN: ${{ secrets.VERDACCIO_AUTH_TOKEN }}
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions: {}
+
+jobs:
+  canary:
+    name: Snapshot Publish
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'yarn'
+          cache-dependency-path: 'yarn.lock'
+          registry-url: ${{ env.VERDACCIO_URL }}
+          scope: '@midnight-ntwrk'
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Configure yarn
+        run: |
+          yarn config set 'npmScopes.midnight-ntwrk.npmAuthToken' "${{ env.VERDACCIO_AUTH_TOKEN }}"
+          yarn config set 'npmScopes.midnight-ntwrk.npmPublishRegistry' "${{ env.VERDACCIO_URL }}"
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Build
+        run: yarn dist:publish
+
+      - name: Snapshot version + publish
+        env:
+          NODE_AUTH_TOKEN: ${{ env.VERDACCIO_AUTH_TOKEN }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          VERSION="0.0.0-canary.${RUN_NUMBER}-${SHORT_SHA}"
+
+          echo "Setting all packages to ${VERSION}"
+
+          # Update version and convert workspace deps to version string
+          for pkg in packages/*/package.json; do
+            jq --arg v "${VERSION}" '
+              .version = $v |
+              if .dependencies then .dependencies |= map_values(if . == "workspace:^" then $v else . end) else . end |
+              if .devDependencies then .devDependencies |= map_values(if . == "workspace:^" then $v else . end) else . end |
+              if .peerDependencies then .peerDependencies |= map_values(if . == "workspace:^" then $v else . end) else . end
+            ' "${pkg}" > tmp.json && mv tmp.json "${pkg}"
+            echo "✓ ${pkg}"
+          done
+
+          # Publish each package
+          for pkg in packages/*/; do
+            if [ -f "${pkg}package.json" ] && jq -e '.private != true' "${pkg}package.json" > /dev/null; then
+              (cd "${pkg}" && yarn npm publish --tag canary --access public) || true
+            fi
+          done
+
+      - name: Cleanup
+        if: always()
+        run: |
+          git reset --hard
+          git clean -fd

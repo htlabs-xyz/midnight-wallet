@@ -1,0 +1,206 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: midnightntwrk/midnight-wallet
+  VERDACCIO_URL: ${{ secrets.VERDACCIO_URL }}
+  VERDACCIO_AUTH_TOKEN: ${{ secrets.VERDACCIO_AUTH_TOKEN }}
+
+permissions: {}
+
+jobs:
+  sync:
+    name: Reset to Upstream & Apply Verdaccio
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.MIDNIGHTCI_PACKAGES_WRITE }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git || true
+          git fetch upstream --tags --force
+
+      - name: Check upstream
+        id: check
+        run: |
+          UPSTREAM=$(git rev-parse upstream/main)
+          UPSTREAM_MSG=$(git log upstream/main -1 --pretty=format:"%s")
+          echo "upstream_sha=${UPSTREAM:0:7}" >> $GITHUB_OUTPUT
+          echo "upstream_msg<<EOF" >> $GITHUB_OUTPUT
+          echo "$UPSTREAM_MSG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "→ Upstream: ${UPSTREAM:0:7} - $UPSTREAM_MSG"
+
+      - name: Backup local files
+        run: |
+          mkdir -p /tmp/backup
+          cp .github/workflows/sync-upstream.yml /tmp/backup/
+
+      - name: Reset to upstream
+        run: git reset --hard upstream/main
+
+      - name: Restore local files
+        run: cp /tmp/backup/sync-upstream.yml .github/workflows/
+
+      - name: Convert registries
+        if: env.VERDACCIO_URL != ''
+        run: |
+          VERDACCIO="${{ env.VERDACCIO_URL }}"
+          NPMJS="${{ env.VERDACCIO_URL }}"
+
+          # .yarnrc.yml
+          sed -i "s|npmPublishRegistry:.*|npmPublishRegistry: '${VERDACCIO}/'|g" .yarnrc.yml
+          sed -i "s|npmRegistryServer:.*|npmRegistryServer: '${NPMJS}'|g" .yarnrc.yml
+
+          # package.json files
+          find packages -name "package.json" -exec sed -i "s|https://npm.pkg.github.com|${VERDACCIO}|g" {} \;
+
+          echo "✓ Converted registries"
+
+      - name: Create cd-canary.yml
+        if: env.VERDACCIO_URL != ''
+        run: |
+          P='$'
+          cat > .github/workflows/cd-canary.yml << EOF
+          name: CD Canary
+
+          env:
+            VERDACCIO_URL: ${P}{{ secrets.VERDACCIO_URL }}
+            VERDACCIO_AUTH_TOKEN: ${P}{{ secrets.VERDACCIO_AUTH_TOKEN }}
+
+          on:
+            workflow_dispatch:
+            push:
+              branches:
+                - main
+
+          permissions: {}
+
+          jobs:
+            canary:
+              name: Snapshot Publish
+              runs-on: ubuntu-latest
+              permissions:
+                packages: write
+                contents: read
+
+              steps:
+                - name: Checkout
+                  uses: actions/checkout@v4
+
+                - name: Setup Node.js
+                  uses: actions/setup-node@v4
+                  with:
+                    node-version-file: '.nvmrc'
+                    cache: 'yarn'
+                    cache-dependency-path: 'yarn.lock'
+                    registry-url: ${P}{{ env.VERDACCIO_URL }}
+                    scope: '@midnight-ntwrk'
+
+                - name: Enable corepack
+                  run: corepack enable
+
+                - name: Configure yarn
+                  run: |
+                    yarn config set 'npmScopes.midnight-ntwrk.npmAuthToken' "${P}{{ env.VERDACCIO_AUTH_TOKEN }}"
+                    yarn config set 'npmScopes.midnight-ntwrk.npmPublishRegistry' "${P}{{ env.VERDACCIO_URL }}"
+
+                - name: Install dependencies
+                  run: yarn install --immutable
+
+                - name: Build
+                  run: yarn dist:publish
+
+                - name: Snapshot version + publish
+                  env:
+                    NODE_AUTH_TOKEN: ${P}{{ env.VERDACCIO_AUTH_TOKEN }}
+                    RUN_NUMBER: ${P}{{ github.run_number }}
+                  run: |
+                    set -euo pipefail
+                    SHORT_SHA=\$(git rev-parse --short=7 HEAD)
+                    VERSION="0.0.0-canary.\${RUN_NUMBER}-\${SHORT_SHA}"
+
+                    echo "Setting all packages to \${VERSION}"
+
+                    # Update version and convert workspace deps to version string
+                    for pkg in packages/*/package.json; do
+                      jq --arg v "\${VERSION}" '
+                        .version = \$v |
+                        if .dependencies then .dependencies |= map_values(if . == "workspace:^" then \$v else . end) else . end |
+                        if .devDependencies then .devDependencies |= map_values(if . == "workspace:^" then \$v else . end) else . end |
+                        if .peerDependencies then .peerDependencies |= map_values(if . == "workspace:^" then \$v else . end) else . end
+                      ' "\${pkg}" > tmp.json && mv tmp.json "\${pkg}"
+                      echo "✓ \${pkg}"
+                    done
+
+                    # Publish each package
+                    for pkg in packages/*/; do
+                      if [ -f "\${pkg}package.json" ] && jq -e '.private != true' "\${pkg}package.json" > /dev/null; then
+                        (cd "\${pkg}" && yarn npm publish --tag canary --access public) || true
+                      fi
+                    done
+
+                - name: Cleanup
+                  if: always()
+                  run: |
+                    git reset --hard
+                    git clean -fd
+          EOF
+          echo "✓ Created cd-canary.yml"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Regenerate yarn.lock
+        if: env.VERDACCIO_URL != ''
+        run: |
+          yarn config set 'npmScopes.midnight-ntwrk.npmRegistryServer' "https://registry.npmjs.org"
+          yarn config set 'npmScopes.midnight-ntwrk.npmPublishRegistry' "${{ env.VERDACCIO_URL }}"
+          yarn cache clean --all || true
+          rm -f yarn.lock
+          
+          # Restore upstream package.json
+          git checkout upstream/main -- package.json
+          
+          # Inject resolutions using jq to force ledger-v8 to 8.0.3
+          jq '.resolutions["@midnight-ntwrk/ledger-v8"] = "8.0.3"' package.json > tmp.json && mv tmp.json package.json
+          
+          # Generate new lockfile
+          yarn install --no-immutable
+
+      - name: Commit and push
+        run: |
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No changes"
+          else
+            git commit -m "${{ steps.check.outputs.upstream_msg }} [verdaccio: ${{ steps.check.outputs.upstream_sha }}]"
+            git push origin main --force
+          fi
+
+      - name: Summary
+        run: |
+          echo "## Sync Complete" >> $GITHUB_STEP_SUMMARY
+          echo "- **Base**: upstream/${{ steps.check.outputs.upstream_sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Registry**: \`${{ env.VERDACCIO_URL }}\`" >> $GITHUB_STEP_SUMMARY
